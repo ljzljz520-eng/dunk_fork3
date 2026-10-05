@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Sequence
 
 from rich.align import Align
 from rich.console import Console
@@ -11,6 +12,7 @@ from rich.table import Table
 from rich.text import Text
 from unidiff import PatchedFile
 
+from dunk.patch_sides import SnapshotTag, TagLevel
 from dunk.underline_bar import UnderlineBar
 
 
@@ -81,14 +83,19 @@ class RemovedFileBody:
 
 @dataclass
 class BinaryFileBody:
-    size_in_bytes: int
+    size_in_bytes: Optional[int] = None
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
         yield Rule(characters="╲", style="hatched")
+        size_note = (
+            f" · {self.size_in_bytes} bytes"
+            if self.size_in_bytes is not None
+            else ""
+        )
         yield Rule(
-            Text(f" File is binary · {self.size_in_bytes} bytes ", style="blue"),
+            Text(f" File is binary{size_note} ", style="blue"),
             characters="╲",
             style="hatched",
         )
@@ -96,9 +103,21 @@ class BinaryFileBody:
         yield Rule(style="border", characters="▔")
 
 
+_TAG_STYLE = {
+    TagLevel.OK: "green",
+    TagLevel.WARN: "yellow",
+    TagLevel.ERROR: "bold red",
+}
+
+
 class PatchedFileHeader:
-    def __init__(self, patch: PatchedFile):
+    def __init__(
+        self,
+        patch: PatchedFile,
+        snapshot_tags: Sequence[SnapshotTag] = (),
+    ):
         self.patch = patch
+        self.snapshot_tags = tuple(snapshot_tags)
         if patch.is_rename:
             self.path_prefix = (
                 f"[dim][s]{escape(Path(patch.source_file).name)}[/] → [/]"
@@ -111,12 +130,53 @@ class PatchedFileHeader:
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
+        title = (
+            f"{self.path_prefix}[b]{escape(self.patch.path)}[/] "
+            f"([green]{self.patch.added} additions[/], "
+            f"[red]{self.patch.removed} removals[/])"
+        )
+        if self.snapshot_tags:
+            tag_parts = "  ".join(
+                f"[{_TAG_STYLE[tag.level]}]⦿ {escape(tag.text)}[/]"
+                for tag in self.snapshot_tags
+            )
+            title = f"{title}\n{tag_parts}"
         yield Rule(
-            f"{self.path_prefix}[b]{escape(self.patch.path)}[/] ([green]{self.patch.added} additions[/], "
-            f"[red]{self.patch.removed} removals[/])",
+            title,
             style="border",
             characters="▁",
         )
+
+
+class SnapshotErrorBody:
+    """Rendered when one file's sides cannot be verified in isolation."""
+
+    def __init__(self, message: str):
+        self.message = message
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        yield Rule(characters="╲", style="hatched")
+        yield Rule(
+            Text(" snapshot consistency error — file skipped ", style="bold red"),
+            characters="╲",
+            style="hatched",
+        )
+        yield Rule(
+            Text(f" {self.message} ", style="red"),
+            characters="╲",
+            style="hatched",
+        )
+        yield Rule(
+            Text(
+                " other files and global statistics are unaffected ",
+                style="dim",
+            ),
+            characters="╲",
+            style="hatched",
+        )
+        yield Rule(style="border", characters="▔")
 
 
 class OnlyRenamedFileBody:

@@ -20,12 +20,14 @@ from unidiff import PatchSet
 from unidiff.patch import Hunk, Line, PatchedFile
 
 import dunk
+from dunk.patch_sides import PatchSideProvider
 from dunk.renderables import (
     PatchSetHeader,
     RemovedFileBody,
     BinaryFileBody,
     PatchedFileHeader,
     OnlyRenamedFileBody,
+    SnapshotErrorBody,
 )
 
 MONOKAI_LIGHT_ACCENT = Color.from_rgb(62, 64, 54).triplet.hex
@@ -42,7 +44,11 @@ theme = Theme(
         "border": MONOKAI_LIGHT_ACCENT,
     }
 )
-force_width, _ = os.get_terminal_size(2)
+try:
+    force_width, _ = os.get_terminal_size(2)
+except OSError:
+    # Not connected to a terminal (e.g. piped in CI / non-tty).
+    force_width = 80
 console = Console(force_terminal=True, width=force_width, theme=theme)
 
 
@@ -98,6 +104,12 @@ def _run_dunk():
 
     project_root: Path = find_git_root()
 
+    # All file sides for this run come from one provider; the provider
+    # never mixes hunk text with unchecked working-tree bytes.
+    provider = PatchSideProvider.open()
+    if provider.root is None:
+        provider.root = project_root
+
     console.print(
         PatchSetHeader(
             file_modifications=len(patch_set.modified_files),
@@ -110,9 +122,9 @@ def _run_dunk():
 
     for is_first, patch in loop_first(patch_set):
         patch = cast(PatchedFile, patch)
-        console.print(PatchedFileHeader(patch))
 
         if patch.is_removed_file:
+            console.print(PatchedFileHeader(patch))
             console.print(RemovedFileBody())
             continue
 
@@ -120,41 +132,44 @@ def _run_dunk():
         target_file = project_root / patch.path
 
         if patch.is_binary_file:
-            console.print(BinaryFileBody(size_in_bytes=target_file.stat().st_size))
+            size = target_file.stat().st_size if target_file.exists() else None
+            console.print(PatchedFileHeader(patch))
+            console.print(BinaryFileBody(size_in_bytes=size))
             continue
 
         if patch.is_rename and not patch.added and not patch.removed:
+            console.print(PatchedFileHeader(patch))
             console.print(OnlyRenamedFileBody(patch))
+            continue
 
-        source_lineno = 1
-        target_lineno = 1
+        if not list(patch):
+            # Mode-only change (or a patch with no displayable hunks).
+            console.print(PatchedFileHeader(patch))
+            console.rule(style="border", characters="▔")
+            continue
 
-        target_code = target_file.read_text()
-        target_lines = target_code.splitlines(keepends=True)
-        source_lineno_max = len(target_lines) - patch.added + patch.removed
+        # Resolve both sides up front, as one immutable, provenance
+        # tracked snapshot. A failure here is scoped to this single
+        # file: it neither changes the global counts above nor aborts
+        # rendering of the remaining files.
+        dual = provider.snapshot(patch)
+        console.print(PatchedFileHeader(patch, dual.tags))
 
-        source_hunk_cache: Dict[int, Hunk] = {hunk.source_start: hunk for hunk in patch}
-        source_reconstructed: List[str] = []
+        if not dual.ok:
+            console.print(SnapshotErrorBody(dual.error or "unknown error"))
+            console.rule(style="border", characters="▔")
+            continue
 
-        while source_lineno <= source_lineno_max:
-            hunk = source_hunk_cache.get(source_lineno)
-            if hunk:
-                # This line can be reconstructed in source from the hunk
-                lines = [line.value for line in hunk.source_lines()]
-                source_reconstructed.extend(lines)
-                source_lineno += hunk.source_length
-                target_lineno += hunk.target_length
-            else:
-                # The line isn't in the diff, pull over current target lines
-                target_line_index = target_lineno - 1
+        # From here on every Syntax view, gutter line number and
+        # intraline comparison consumes the same immutable snapshot.
+        source_snapshot = dual.source
+        target_snapshot = dual.target
 
-                line = target_lines[target_line_index]
-                source_reconstructed.append(line)
+        target_code = target_snapshot.text
+        target_line_count = target_snapshot.line_count
+        source_code = source_snapshot.text
+        source_lineno_max = source_snapshot.line_count
 
-                source_lineno += 1
-                target_lineno += 1
-
-        source_code = "".join(source_reconstructed)
         lexer = Syntax.guess_lexer(patch.path)
 
         for is_first_hunk, hunk in loop_first(patch):
@@ -383,7 +398,7 @@ def _run_dunk():
                 ColorTriplet(0, 255, 0),
                 target_lineno_to_padding,
                 dict(row_number_to_insertion_ranges),
-                gutter_size=len(str(len(target_lines) + 1)) + 2,
+                gutter_size=len(str(max(target_line_count, 1))) + 2,
             )
 
             table = Table.grid()
@@ -405,6 +420,8 @@ def _run_dunk():
 
         # TODO: File name indicator at bottom of file, if diff is larger than terminal height.
         console.rule(style="border", characters="▔")
+
+    provider.close()
 
     console.print(
         Align.right(
